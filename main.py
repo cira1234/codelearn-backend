@@ -420,3 +420,173 @@ def otp_resend(data: dict):
         return {"success": True, "expires_in": OTP_TTL}
     finally:
         conn.close()
+
+def get_conn():
+    return pymysql.connect(**DB_CONFIG)
+
+
+# ---------- 1) กลุ่มเรียน: เข้าห้องด้วยรหัส ----------
+@app.post("/classes/join")
+def join_class(data: dict):
+    user_id = data.get("user_id")
+    join_code = str(data.get("join_code", "")).strip().upper()
+    if not user_id or not join_code:
+        return {"success": False, "error": "ข้อมูลไม่ครบ"}
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM class_groups WHERE join_code = %s", (join_code,))
+            cls = c.fetchone()
+            if not cls:
+                return {"success": False, "error": "รหัสห้องเรียนไม่ถูกต้อง"}
+
+            # INSERT IGNORE: ถ้าเคยเข้าแล้ว จะไม่เพิ่มซ้ำและไม่ error
+            c.execute(
+                "INSERT IGNORE INTO enrollments (user_id, class_group_id) VALUES (%s, %s)",
+                (user_id, cls["id"]),
+            )
+            conn.commit()
+            return {"success": True, "class": cls}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+
+# ---------- 2) กลุ่มเรียน: ออกจากห้อง ----------
+@app.post("/classes/leave")
+def leave_class(data: dict):
+    user_id = data.get("user_id")
+    class_group_id = data.get("class_group_id")
+    if not user_id or not class_group_id:
+        return {"success": False, "error": "ข้อมูลไม่ครบ"}
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                "DELETE FROM enrollments WHERE user_id = %s AND class_group_id = %s",
+                (user_id, class_group_id),
+            )
+            conn.commit()
+            return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+
+# ---------- 3) กลุ่มเรียน: รายวิชาของฉัน ----------
+@app.get("/classes/my/{user_id}")
+def my_classes(user_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """SELECT g.* FROM class_groups g
+                   JOIN enrollments e ON e.class_group_id = g.id
+                   WHERE e.user_id = %s
+                   ORDER BY e.joined_at DESC""",
+                (user_id,),
+            )
+            return {"success": True, "data": c.fetchall()}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+
+# ---------- 4) กลุ่มเรียน: รายละเอียดห้องเดียว ----------
+@app.get("/classes/{class_id}")
+def class_detail(class_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM class_groups WHERE id = %s", (class_id,))
+            cls = c.fetchone()
+            if not cls:
+                return {"success": False, "error": "ไม่พบห้องเรียน"}
+            return {"success": True, "class": cls}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+
+# ---------- 5) ภาค: กลางภาค / ปลายภาค ของห้องนี้ ----------
+@app.get("/classes/{class_id}/sections")
+def get_sections(class_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(
+                """
+                SELECT section_id, class_group_id, name,
+                       day_sob,
+                       TIME_FORMAT(start_sob_time, '%%H:%%i') AS start_sob_time,
+                       TIME_FORMAT(end_sob_time, '%%H:%%i') AS end_sob_time
+                FROM sections
+                WHERE class_group_id = %s
+                ORDER BY sort_order Desc
+                """,
+                (class_id,),
+            )
+            rows = cur.fetchall()
+        for r in rows:
+            r["day_sob"] = r["day_sob"].isoformat() if r["day_sob"] else None
+        return {"success": True, "sections": rows}
+    finally:
+        conn.close()
+
+
+# ---------- 6) บท: บทในภาคนี้ พร้อมสถานะติ๊กถูกของนักเรียน ----------
+@app.get("/sections/{section_id}/chapters")
+def get_chapters(section_id: int, user_id: int = 0):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """SELECT ch.*,
+                          COALESCE(p.quiz_done, 0) AS quiz_done,
+                          COALESCE(p.lab_done, 0)  AS lab_done
+                   FROM chapters ch
+                   LEFT JOIN chapter_progress p
+                          ON p.chapter_id = ch.id AND p.user_id = %s
+                   WHERE ch.section_id = %s
+                   ORDER BY ch.chapter_no""",
+                (user_id, section_id),
+            )
+            return {"success": True, "data": c.fetchall()}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+
+# ---------- 7) ความคืบหน้า: บันทึกว่าส่ง Quiz / Lab แล้ว ----------
+@app.post("/progress/update")
+def update_progress(data: dict):
+    user_id = data.get("user_id")
+    chapter_id = data.get("chapter_id")
+    quiz_done = 1 if data.get("quiz_done") else 0
+    lab_done = 1 if data.get("lab_done") else 0
+    if not user_id or not chapter_id:
+        return {"success": False, "error": "ข้อมูลไม่ครบ"}
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """INSERT INTO chapter_progress (user_id, chapter_id, quiz_done, lab_done)
+                   VALUES (%s, %s, %s, %s)
+                   ON DUPLICATE KEY UPDATE quiz_done = VALUES(quiz_done),
+                                           lab_done  = VALUES(lab_done)""",
+                (user_id, chapter_id, quiz_done, lab_done),
+            )
+            conn.commit()
+            return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
