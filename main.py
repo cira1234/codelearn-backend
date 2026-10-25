@@ -1,7 +1,8 @@
 import os, secrets, hashlib, hmac, smtplib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from fastapi import FastAPI
+from fastapi import Response, Request, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from numpy import var
@@ -14,17 +15,22 @@ from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 import requests as http_requests
 from dotenv import load_dotenv
+import jwt
+from fastapi.responses import FileResponse
 
 app = FastAPI()
 load_dotenv()
-   
+
+
+
+JWT_SECRET = os.environ.get("JWT_SECRET", "") 
 app.add_middleware(
         CORSMiddleware,
         allow_origins=[
             "http://localhost:3000",
             "http://127.0.0.1:3000",
         ],
-        allow_credentials=False,
+        allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -117,42 +123,89 @@ async def compile_cpp(data: dict):
     # ---------------------------------------------------------
     # 2. เส้น API สำหรับให้ AI วิเคราะห์ Error (เรียกใช้เมื่อกดปุ่ม)
     # ---------------------------------------------------------
-@app.post("/useai")
-async def use_ai(data: dict):
-        # รับ Error ดิบที่ Flutter เก็บไว้ ส่งมาให้เส้นนี้
-        raw_error = data.get("error", "")
-        code = data.get("code", "") # (Optional) รับโค้ดมาด้วยเพื่อให้ AI เข้าใจบริบทมากขึ้น
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODELS = [
+    m.strip().replace("models/", "")
+    for m in os.environ.get(
+        "GEMINI_MODELS",
+        "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash-lite",
+    ).split(",")
+    if m.strip()
+]
 
-        if not raw_error:
-            return {"ai_explanation": "ไม่พบข้อความ Error สำหรับวิเคราะห์"}
 
+def call_gemini(prompt: str):
+    """ลองทีละรุ่นตามลำดับ คืน (ข้อความ, ข้อความ error ล่าสุด)"""
+    last_err = ""
+    for model in GEMINI_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        body = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.2},
+        }
         try:
-            # สามารถใส่โค้ดเข้าไปใน Prompt ด้วยเพื่อให้ AI บอกบรรทัดที่ผิดได้แม่นยำขึ้น
-            ai_prompt = f"ช่วยอธิบาย C++ Error ต่อไปนี้เป็นภาษาไทยให้กระชับ สั้นๆ เข้าใจง่าย พร้อมบอกวิธีแก้:\n\nError:\n{raw_error}"
-            if code:
-                ai_prompt += f"\n\nCode:\n{code}"
-
-            ai_response = ollama.chat(
-                model="gemma3:4b",
-                messages=[{"role": "user", "content": ai_prompt}],
-                stream=False,
-                options={
-                    "num_predict": 150,  # บังคับให้ตอบไม่เกิน ~150 tokens (ประมาณ 3-4 บรรทัด)
-                    "temperature": 0.2   # ลดความ Creative ลง ทำให้ AI คิดคำตอบที่ตรงไปตรงมาได้เร็วขึ้น
-                }
+            r = http_requests.post(
+                url,
+                headers={"x-goog-api-key": GEMINI_API_KEY},
+                json=body,
+                timeout=10,
             )
-            ai_explanation = ai_response["message"]["content"]
-            
-            return {
-                "success": True,
-                "ai_explanation": ai_explanation
-            }
         except Exception as e:
-            return {
-                "success": False,
-                "ai_explanation": f"ไม่สามารถดึงคำอธิบายจาก AI ได้ (ระบบอาจมีปัญหา): {str(e)}"
-            }
+            last_err = f"{model}: {type(e).__name__}"
+            print("Gemini error:", last_err)
+            continue
 
+        if r.status_code == 200:
+            try:
+                parts = r.json()["candidates"][0]["content"]["parts"]
+                text = "".join(p.get("text", "") for p in parts).strip()
+            except (KeyError, IndexError, TypeError):
+                text = ""
+            if text:
+                print(f"Gemini OK: {model} ใช้เวลา {r.elapsed.total_seconds():.1f} วินาที")
+                return text, ""
+            last_err = f"{model}: ตอบกลับว่าง"
+            print("Gemini error:", last_err)
+            continue
+
+        last_err = f"{model}: HTTP {r.status_code}"
+        print("Gemini error:", last_err, r.text[:200])
+        if r.status_code in (400, 401, 403):
+            break  # คีย์/สิทธิ์ผิด ลองรุ่นอื่นก็ไม่ช่วย
+    return "", last_err
+
+
+@app.post("/useai")
+def use_ai(data: dict):
+    raw_error = data.get("error", "")
+    code = data.get("code", "")
+
+    if not raw_error:
+        return {"success": False, "ai_explanation": "ไม่พบข้อความ Error สำหรับวิเคราะห์"}
+    if not GEMINI_API_KEY:
+        return {"success": False, "ai_explanation": "ยังไม่ได้ตั้ง GEMINI_API_KEY ใน .env"}
+
+    prompt = (
+        "คุณเป็นติวเตอร์ภาษา C ที่ใจดี สอนนักเรียนมือใหม่ที่เพิ่งเริ่มเรียนเขียนโปรแกรม\n"
+        "ตอบเป็นภาษาไทย ใช้คำง่ายๆ ไม่ใช้ศัพท์ยากโดยไม่อธิบาย "
+        "ถ้าต้องใช้ศัพท์เทคนิค ให้ใส่คำอธิบายสั้นๆ ในวงเล็บ\n"
+        "ตอบตามหัวข้อนี้ ไม่เกิน 6 บรรทัดรวม:\n"
+        "1) ปัญหาคืออะไร (อธิบายด้วยภาษาคนทั่วไป 1-2 ประโยค)\n"
+        "2) เกิดที่บรรทัดไหน หรือตรงส่วนไหนของโค้ด\n"
+        "3) วิธีแก้ (บอกแนวทาง และยกตัวอย่างบรรทัดที่แก้แล้วได้ "
+        "แต่ไม่ต้องเขียนโปรแกรมทั้งหมดให้)\n\n"
+        f"ข้อความ Error จากคอมไพเลอร์:\n{raw_error}"
+    )
+    if code:
+        prompt += f"\n\nโค้ดของนักเรียน:\n{code}"
+
+    text, err = call_gemini(prompt)
+    if text:
+        return {"success": True, "ai_explanation": text}
+    return {
+        "success": False,
+        "ai_explanation": "AI ไม่ว่างในขณะนี้ กรุณาลองใหม่อีกครั้งในอีกสักครู่",
+    }
 
 
 
@@ -249,7 +302,6 @@ def mask_email(email: str) -> str:
 DEV_MODE = False
 
 def send_otp_email(to_email: str, code: str):
-    print("SMTP_USER =", repr(SMTP_USER), "| pw length =", len(SMTP_APP_PASSWORD))
     if DEV_MODE:
         print(f"[DEV] OTP for {to_email}: {code}")
         return
@@ -260,10 +312,13 @@ def send_otp_email(to_email: str, code: str):
     msg["Subject"] = "CodeLearn verification code"
     msg["From"] = SMTP_USER
     msg["To"] = to_email
-    with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as s:
-        s.starttls()
-        s.login(SMTP_USER, SMTP_APP_PASSWORD)
-        s.send_message(msg)
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_APP_PASSWORD)
+            s.send_message(msg)
+    except Exception as e:
+        print("send_otp_email failed:", e)
 
 GOOGLE_CLIENT_ID = "881235919126-ujqt791nd9jffe38udomnbbbg6ocgho3.apps.googleusercontent.com"
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
@@ -319,8 +374,8 @@ def google_login_code(data: dict):
                 """,
                 (google_id, email, name, picture),
             )
-            cursor.execute("SELECT id FROM users WHERE google_id = %s", (google_id,))
-            user_id = cursor.fetchone()["id"]
+            cursor.execute("SELECT user_id FROM users WHERE google_id = %s", (google_id,))
+            user_id = cursor.fetchone()["user_id"]
 
             # 4. สร้าง OTP แล้วเก็บแบบแฮช
             pending_token = secrets.token_urlsafe(32)[:64]
@@ -353,7 +408,7 @@ def google_login_code(data: dict):
         return {"success": False, "error": f"OTP Error: {str(e)}"}
 
 @app.post("/auth/otp/verify")
-def otp_verify(data: dict):
+def otp_verify(data: dict, response: Response):
     token = data.get("pending_token", "")
     code = str(data.get("code", ""))
     conn = pymysql.connect(**DB_CONFIG)
@@ -379,11 +434,36 @@ def otp_verify(data: dict):
                 conn.commit()
                 return {"success": False, "error": "รหัสไม่ถูกต้อง"}
 
-            c.execute("SELECT * FROM users WHERE id = %s", (row["user_id"],))
+            c.execute("SELECT * FROM users WHERE user_id = %s", (row["user_id"],))
             user = c.fetchone()
-            c.execute("DELETE FROM otp_codes WHERE id = %s", (row["id"],))  # ใช้ได้ครั้งเดียว
+            c.execute("DELETE FROM otp_codes WHERE id = %s", (row["id"],))
             conn.commit()
-            return {"success": True, "user": user}
+
+        if not user:
+            return {"success": False, "error": "ไม่พบผู้ใช้ กรุณาล็อกอินใหม่"}
+
+        # ตาราง users ใช้ user_id เป็นคีย์หลัก
+        uid = user["user_id"]
+        user["id"] = uid  # ใส่ id เพิ่มให้หน้าเว็บที่อ่าน user.id ยังใช้ได้
+
+        if not JWT_SECRET:
+            return {"success": False, "error": "เซิร์ฟเวอร์ยังไม่ได้ตั้ง JWT_SECRET"}
+        jwt_token = jwt.encode(
+            {
+                "user_id": uid,
+                "exp": datetime.now(timezone.utc) + timedelta(days=7),
+            },
+            JWT_SECRET,
+            algorithm="HS256",
+        )
+        response.set_cookie(
+            key="token",
+            value=jwt_token,
+            httponly=True,
+            samesite="lax",
+            max_age=7 * 24 * 3600,
+        )
+        return {"success": True, "user": user}
     finally:
         conn.close()
 
@@ -396,7 +476,7 @@ def otp_resend(data: dict):
         with conn.cursor() as c:
             c.execute(
                 """SELECT o.*, u.email FROM otp_codes o
-                   JOIN users u ON u.id = o.user_id
+                   JOIN users u ON u.user_id = o.user_id
                    WHERE o.pending_token = %s""",
                 (token,),
             )
@@ -522,13 +602,13 @@ def get_sections(class_id: int):
         with conn.cursor(pymysql.cursors.DictCursor) as cur:
             cur.execute(
                 """
-                SELECT section_id, class_group_id, name,
+                SELECT section_id as id, class_group_id, name,
                        day_sob,
                        TIME_FORMAT(start_sob_time, '%%H:%%i') AS start_sob_time,
                        TIME_FORMAT(end_sob_time, '%%H:%%i') AS end_sob_time
                 FROM sections
                 WHERE class_group_id = %s
-                ORDER BY sort_order Desc
+                ORDER BY sort_order Asc
                 """,
                 (class_id,),
             )
@@ -541,28 +621,53 @@ def get_sections(class_id: int):
 
 
 # ---------- 6) บท: บทในภาคนี้ พร้อมสถานะติ๊กถูกของนักเรียน ----------
-@app.get("/sections/{section_id}/chapters")
-def get_chapters(section_id: int, user_id: int = 0):
+SLIDES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads", "slides")
+
+
+@app.get("/chapters/{chapter_id}/slides")
+def get_chapter_slides(chapter_id: int):
     conn = get_conn()
     try:
         with conn.cursor() as c:
             c.execute(
-                """SELECT ch.*,
-                          COALESCE(p.quiz_done, 0) AS quiz_done,
-                          COALESCE(p.lab_done, 0)  AS lab_done
-                   FROM chapters ch
-                   LEFT JOIN chapter_progress p
-                          ON p.chapter_id = ch.id AND p.user_id = %s
-                   WHERE ch.section_id = %s
-                   ORDER BY ch.chapter_no""",
-                (user_id, section_id),
+                """SELECT slide_id, title, file_name
+                   FROM slides
+                   WHERE chapter_id = %s
+                   ORDER BY slide_id""",
+                (chapter_id,),
             )
-            return {"success": True, "data": c.fetchall()}
+            return {"success": True, "slides": c.fetchall()}
     except Exception as e:
         return {"success": False, "error": f"Database Error: {str(e)}"}
     finally:
         conn.close()
 
+
+@app.get("/slides/{slide_id}/file")
+def get_slide_file(slide_id: int, download: int = 0):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT file_name FROM slides WHERE slide_id = %s", (slide_id,))
+            row = c.fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="ไม่พบสไลด์")
+
+    # basename กันการใส่ path แปลกๆ ออกนอกโฟลเดอร์
+    name = os.path.basename(row["file_name"])
+    path = os.path.join(SLIDES_DIR, name)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="ไม่พบไฟล์ PDF บนเซิร์ฟเวอร์")
+
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        filename=name,
+        content_disposition_type="attachment" if download else "inline",
+    )
 
 # ---------- 7) ความคืบหน้า: บันทึกว่าส่ง Quiz / Lab แล้ว ----------
 @app.post("/progress/update")
@@ -586,6 +691,117 @@ def update_progress(data: dict):
             )
             conn.commit()
             return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+def get_current_user(request: Request) -> int:
+    token = request.cookies.get("token")
+    if not token:
+        raise HTTPException(status_code=401, detail="ยังไม่ได้ล็อกอิน")
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="token ไม่ถูกต้องหรือหมดอายุ")
+    return payload["user_id"]
+
+
+@app.get("/auth/me")
+def auth_me(user_id: int = Depends(get_current_user)):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT user_id, name, email, picture FROM users WHERE user_id = %s", (user_id,))
+            user = c.fetchone()
+        return {"success": True, "user": user}
+    finally:
+        conn.close()
+
+
+@app.post("/auth/logout")
+def auth_logout(response: Response):
+    response.delete_cookie("token")
+    return {"success": True}
+
+@app.get("/sections/{section_id}")
+def get_section(section_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(
+                """
+                SELECT s.section_id AS id,
+                       s.name,
+                       s.class_group_id AS class_id,
+                       c.course_title
+                FROM sections s
+                JOIN class_groups c ON c.id = s.class_group_id
+                WHERE s.section_id = %s
+                """,
+                (section_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return {"success": False, "error": "ไม่พบเนื้อหานี้"}
+        return {"success": True, "section": row}
+    finally:
+        conn.close()
+
+
+@app.get("/sections/{section_id}/chapters")
+def get_chapters(section_id: int, user_id: int = 0):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """SELECT ch.*,
+                          COALESCE(p.quiz_done, 0) AS quiz_done,
+                          COALESCE(p.lab_done, 0)  AS lab_done
+                   FROM chapters ch
+                   LEFT JOIN chapter_progress p
+                          ON p.chapter_id = ch.id AND p.user_id = %s
+                   WHERE ch.section_id = %s
+                   ORDER BY ch.chapter_no""",
+                (user_id, section_id),
+            )
+            return {"success": True, "data": c.fetchall()}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+@app.get("/chapters/{chapter_id}")
+def get_chapter(chapter_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """SELECT ch.id, ch.chapter_no, ch.title, ch.section_id,
+                          s.name AS section_name
+                   FROM chapters ch
+                   JOIN sections s ON s.section_id = ch.section_id
+                   WHERE ch.id = %s""",
+                (chapter_id,),
+            )
+            row = c.fetchone()
+        if not row:
+            return {"success": False, "error": "ไม่พบบทเรียน"}
+        return {"success": True, "chapter": row}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+@app.get("/chapters/{chapter_id}/labs")
+def get_chapter_labs(chapter_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT * FROM lab WHERE lab_ofchapter = %s",
+                (chapter_id,),
+            )
+            return {"success": True, "labs": c.fetchall()}
     except Exception as e:
         return {"success": False, "error": f"Database Error: {str(e)}"}
     finally:
