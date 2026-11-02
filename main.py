@@ -17,11 +17,15 @@ import requests as http_requests
 from dotenv import load_dotenv
 import jwt
 from fastapi.responses import FileResponse
+import random
+import os
+import uuid
+from fastapi import File, Form, UploadFile
 
 app = FastAPI()
 load_dotenv()
 
-
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "") 
 app.add_middleware(
@@ -802,6 +806,178 @@ def get_chapter_labs(chapter_id: int):
                 (chapter_id,),
             )
             return {"success": True, "labs": c.fetchall()}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+@app.get("/admin/teachers")
+def list_teachers(user_id: int = Depends(get_current_user)):
+    # TODO: ตรวจว่าผู้เรียกเป็นแอดมินจริง (ตอนนี้แค่ต้องล็อกอิน)
+    conn = get_conn()
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(
+                """
+                SELECT u.user_id AS id,
+                       u.email,
+                       u.name,
+                       u.picture,
+                       GROUP_CONCAT(DISTINCT cg.group_name
+                                    ORDER BY cg.group_name SEPARATOR ', ') AS group_names,
+                       GROUP_CONCAT(DISTINCT cg.term
+                                    ORDER BY cg.term SEPARATOR ', ') AS term_list
+                FROM users u
+                LEFT JOIN class_groups cg ON cg.teacher_name = u.name
+                WHERE u.role = 1
+                GROUP BY u.user_id, u.email, u.name, u.picture
+                ORDER BY u.name
+                """
+            )
+            rows = cur.fetchall()
+        return {"success": True, "data": rows}
+    finally:
+        conn.close()
+
+@app.post("/admin/teachers")
+def create_teacher(data: dict):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                "INSERT INTO users (email, name, picture, role) VALUES (%s, %s, '', 2)",
+                (data["email"], data["name"] + " " + data["surname"]),
+            )
+            conn.commit()
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+@app.get("/admin/class-groups")
+def list_class_groups():
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                SELECT id, group_name, term,
+                       teacher_name AS teacher,
+                       	teacher_assist AS assistant
+                FROM class_groups
+                ORDER BY term, group_name
+                """
+            )
+            rows = c.fetchall()
+        return {"success": True, "data": rows}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+
+
+@app.post("/admin/insert-class-groups")
+def create_class_group(data: dict):
+    join_code = str(random.randint(1000, 9999))
+    assistant = data.get("assistant") or None
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO class_groups
+                (join_code, course_title, term, group_name, teacher_name, teacher_assist)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (join_code, data["detail"], data["term"], data["group_name"], data["teacher"], assistant),
+            )
+        conn.commit()
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+@app.get("/admin/terms")
+def term_options():
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT id_term, term FROM term ORDER BY id_term")
+            rows = c.fetchall()
+        return {"success": True, "data": rows}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+@app.get("/admin/teacher-options")
+def teacher_options():
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT user_id, name FROM users WHERE role = 1 ORDER BY name")
+            rows = c.fetchall()
+        return {"success": True, "data": rows}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+
+@app.post("/admin/upload-file")
+def upload_file(
+    chapter_id: int = Form(...),
+    video_url: str = Form(""),
+    file: UploadFile = File(None),
+):
+    if file is None:
+        return {"success": False, "error": "กรุณาเลือกไฟล์ PDF"}
+    if not file.filename.lower().endswith(".pdf"):
+        return {"success": False, "error": "รองรับเฉพาะไฟล์ .pdf"}
+
+    content = file.file.read()
+    if len(content) > 50 * 1024 * 1024:
+        return {"success": False, "error": "ไฟล์ใหญ่เกิน 50MB"}
+
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    stored_name = uuid.uuid4().hex + ".pdf"
+    with open(os.path.join(UPLOAD_DIR, stored_name), "wb") as f:
+        f.write(content)
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO slides (chapter_id, title, file_name, video_url)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (chapter_id, file.filename, stored_name, video_url or None),
+            )
+        conn.commit()
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+
+@app.get("/admin/chapter-options")
+def chapter_options():
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                SELECT chapters.id, chapters.chapter_no, chapters.title,
+                       sections.name AS section_name
+                FROM chapters
+                JOIN sections ON sections.section_id = chapters.section_id
+                ORDER BY sections.sort_order, chapters.chapter_no
+                """
+            )
+            rows = c.fetchall()
+        return {"success": True, "data": rows}
     except Exception as e:
         return {"success": False, "error": f"Database Error: {str(e)}"}
     finally:
