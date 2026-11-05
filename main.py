@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 import jwt
 from fastapi.responses import FileResponse
 import random
-import os
+
 import uuid
 from fastapi import File, Form, UploadFile
 import json
@@ -28,6 +28,16 @@ import re
 import time
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from typing import Dict
+from typing import Optional
+
+LETTERS = ["a", "b", "c", "d"]
+
+class LabSubmitIn(BaseModel):
+    user_id: int
+    id_lab: int
+    code: str
+    output: str = ""
 
 class ProfileIn(BaseModel):
     user_id: int
@@ -388,19 +398,34 @@ def google_login_code(data: dict):
         return {"success": False, "error": f"Google Error: {str(e)}"}
 
     try:
-        # 3. บันทึกผู้ใช้
+        # 3. บันทึกผู้ใช้ (หาจาก google_id หรือ email)
         connection = pymysql.connect(**DB_CONFIG)
         with connection.cursor() as cursor:
             cursor.execute(
-                """
-                INSERT INTO users (google_id, email, name, picture)
-                VALUES (%s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE name = VALUES(name), picture = VALUES(picture)
-                """,
-                (google_id, email, name, picture),
+                "SELECT user_id FROM users WHERE google_id = %s OR email = %s "
+                "ORDER BY (google_id = %s) DESC LIMIT 1",
+                (google_id, email, google_id),
             )
-            cursor.execute("SELECT user_id FROM users WHERE google_id = %s", (google_id,))
-            user_id = cursor.fetchone()["user_id"]
+            u = cursor.fetchone()
+            if u:
+                user_id = u["user_id"]
+                # ไม่แตะ role / เติม google_id ให้แถวที่ยังไม่มีของจริง
+                # ชื่ออัปเดตเฉพาะ role 0 (อาจารย์ role 1 ไม่ถูกเขียนทับ)
+                cursor.execute(
+                    """UPDATE users
+                       SET google_id = IF(google_id IS NULL OR google_id = '' OR google_id LIKE 'seed-%%', %s, google_id),
+                           picture = %s,
+                           name = IF(role = 0, %s, name)
+                       WHERE user_id = %s""",
+                    (google_id, picture, name, user_id),
+                )
+            else:
+                # ไม่เจอทั้ง google_id และ email = คนใหม่ role เริ่มต้นเป็น 0
+                cursor.execute(
+                    "INSERT INTO users (google_id, email, name, picture) VALUES (%s, %s, %s, %s)",
+                    (google_id, email, name, picture),
+                )
+                user_id = cursor.lastrowid
 
             # 4. สร้าง OTP แล้วเก็บแบบแฮช
             pending_token = secrets.token_urlsafe(32)[:64]
@@ -866,7 +891,7 @@ def create_teacher(data: dict):
     try:
         with conn.cursor() as c:
             c.execute(
-                "INSERT INTO users (email, name, picture, role) VALUES (%s, %s, '', 2)",
+                "INSERT INTO users (email, name, picture, role) VALUES (%s, %s, '', 1)",
                 (data["email"], data["name"] + " " + data["surname"]),
             )
             conn.commit()
@@ -901,17 +926,37 @@ def list_class_groups():
 @app.post("/admin/insert-class-groups")
 def create_class_group(data: dict):
     join_code = str(random.randint(1000, 9999))
-    assistant = data.get("assistant") or None
+    teacher_id = data.get("teacher_id")
+    assistant_id = data.get("assistant_id") or None
+    if not teacher_id:
+        return {"success": False, "error": "กรุณาเลือกอาจารย์ผู้สอน"}
+
     conn = get_conn()
     try:
         with conn.cursor() as c:
+            def name_of(uid):
+                if not uid:
+                    return None
+                c.execute("SELECT name FROM users WHERE user_id = %s AND role = 1", (uid,))
+                r = c.fetchone()
+                return r["name"] if r else None
+
+            teacher_name = name_of(teacher_id)
+            if not teacher_name:
+                return {"success": False, "error": "ไม่พบอาจารย์ผู้สอน (ต้องเป็น role 1)"}
+            assistant_name = name_of(assistant_id)
+            if assistant_id and not assistant_name:
+                return {"success": False, "error": "ไม่พบผู้ช่วยสอน (ต้องเป็น role 1)"}
+
             c.execute(
                 """
                 INSERT INTO class_groups
-                (join_code, course_title, term, group_name, teacher_name, teacher_assist)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                (join_code, course_title, term, group_name,
+                 teacher_name, teacher_id, teacher_assist, assistant_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                (join_code, data["detail"], data["term"], data["group_name"], data["teacher"], assistant),
+                (join_code, data["detail"], data["term"], data["group_name"],
+                 teacher_name, teacher_id, assistant_name, assistant_id),
             )
         conn.commit()
         return {"success": True}
@@ -1069,8 +1114,8 @@ def create_lab(data: dict):
     try:
         with conn.cursor() as c:
             c.execute(
-                "INSERT INTO lab (namelab, detail, lab_ofchapter) VALUES (%s, %s, %s)",
-                (data["namelab"], data["detail"], data["chapter_id"]),
+                "INSERT INTO lab (labchapter, namelab, detail, lab_ofchapter) VALUES (%s, %s, %s, %s)",
+                (data["chapter_no"], data["namelab"], data["detail"], data["chapter_id"]),
             )
         conn.commit()
         return {"success": True}
@@ -1109,60 +1154,7 @@ os.makedirs(QUIZ_UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads/quiz", StaticFiles(directory=QUIZ_UPLOAD_DIR), name="quiz_images")
 
 
-@app.post("/admin/quiz-questions")
-def create_quiz_question(
-    chapter_id: int = Form(...),
-    question: str = Form(...),
-    choice_a: str = Form(""),
-    choice_b: str = Form(""),
-    choice_c: str = Form(""),
-    choice_d: str = Form(""),
-    correct_choice: str = Form(...),
-    explanation: str = Form(""),
-    explanation_wrong: str = Form(""),
-    image: UploadFile | None = File(None),
-):
-    if correct_choice not in ("a", "b", "c", "d"):
-        return {"success": False, "error": "คำตอบที่ถูกต้องไม่ถูกต้อง"}
 
-    quiz_dir = os.path.join(UPLOAD_DIR, "quiz")
-
-    # รูปโจทย์ (ถ้ามี): รับเฉพาะ png/jpg/jpeg ไม่เกิน 50MB เก็บชื่อสุ่มบนดิสก์ กันชื่อซ้ำ/path อันตราย
-    image_file = None
-    if image and image.filename:
-        ext = os.path.splitext(image.filename)[1].lower()
-        if ext not in (".png", ".jpg", ".jpeg"):
-            return {"success": False, "error": "รองรับเฉพาะไฟล์ .png .jpg .jpeg"}
-        limit = 50 * 1024 * 1024
-        data = image.file.read(limit + 1)
-        if len(data) > limit:
-            return {"success": False, "error": "ไฟล์ใหญ่เกิน 50MB"}
-        os.makedirs(quiz_dir, exist_ok=True)
-        image_file = uuid.uuid4().hex + ext
-        with open(os.path.join(quiz_dir, image_file), "wb") as f:
-            f.write(data)
-
-    conn = get_conn()
-    try:
-        with conn.cursor() as c:
-            c.execute(
-                "INSERT INTO quiz_questions (chapter_id, question, choice_a, choice_b, choice_c, "
-                "choice_d, correct_choice, image_file, explanation, explanation_wrong) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (chapter_id, question, choice_a, choice_b, choice_c, choice_d,
-                 correct_choice, image_file, explanation, explanation_wrong),
-            )
-            conn.commit()
-        return {"success": True}
-    except Exception as e:
-        if image_file:  # บันทึก DB ไม่สำเร็จ ลบรูปที่เพิ่งเก็บทิ้ง
-            try:
-                os.remove(os.path.join(quiz_dir, image_file))
-            except OSError:
-                pass
-        return {"success": False, "error": f"Database Error: {str(e)}"}
-    finally:
-        conn.close()
 
 
 def save_quiz_image(f):
@@ -2052,5 +2044,954 @@ def delete_document(source: str, doc_id: int):
         if os.path.isfile(path):
             os.remove(path)
         return {"success": True}
+    finally:
+        conn.close()
+
+from pydantic import BaseModel
+from typing import Dict
+
+LETTERS = ["a", "b", "c", "d"]
+
+@app.get("/quiz/chapter/{chapter_id}")
+def quiz_by_chapter(chapter_id: int):
+    conn = get_conn()  # <- เปลี่ยนให้ตรงกับของจริง
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT question_id, question, choice_type, image_file,
+                       choice_a, choice_b, choice_c, choice_d
+                FROM quiz_questions
+                WHERE chapter_id = %s AND status = 'published'
+                ORDER BY question_id
+            """, (chapter_id,))
+            rows = cur.fetchall()
+        data = []
+        for r in rows:
+            choices = [
+                {"key": k, "value": r[f"choice_{k}"]}
+                for k in LETTERS
+                if r.get(f"choice_{k}") not in (None, "")
+            ]
+            data.append({
+                "question_id": r["question_id"],
+                "question": r["question"],
+                "choice_type": r["choice_type"] or "text",
+                "image_file": r["image_file"],
+                "choices": choices,
+            })
+        return {"success": True, "data": data}
+    finally:
+        conn.close()
+
+
+class QuizSubmit(BaseModel):
+    answers: Dict[str, str]  # question_id -> "a".."d"
+
+class QuizSubmit(BaseModel):
+    user_id: int  # 👈 เพิ่มบรรทัดนี้ (Frontend ต้องส่ง user_id มาด้วย)
+    answers: Dict[str, str]
+
+@app.post("/quiz/chapter/{chapter_id}/submit")
+def quiz_submit(chapter_id: int, body: QuizSubmit):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT question_id, correct_choice, explanation, explanation_wrong
+                FROM quiz_questions
+                WHERE chapter_id = %s AND status = 'published'
+                ORDER BY question_id
+            """, (chapter_id,))
+            rows = cur.fetchall()
+            
+            items, score = [], 0
+            for r in rows:
+                correct = (r["correct_choice"] or "").strip().lower()
+                chosen = (body.answers.get(str(r["question_id"])) or "").strip().lower()
+                ok = chosen != "" and chosen == correct
+                score += 1 if ok else 0
+                items.append({
+                    "question_id": r["question_id"],
+                    "chosen": chosen,
+                    "correct": correct,
+                    "is_correct": ok,
+                    "explanation": r["explanation"],
+                    "explanation_wrong": r["explanation_wrong"],
+                })
+                
+            # 👇 ย้าย INSERT เข้ามาไว้ใน with block เดียวกัน
+            if len(rows) > 0:
+                cur.execute("""
+                    INSERT INTO quiz_submissions (user_id, chapter_id, score, total)
+                    VALUES (%s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE 
+                        score = VALUES(score), 
+                        total = VALUES(total), 
+                        submitted_at = NOW()
+                """, (body.user_id, chapter_id, score, len(rows)))
+            
+            conn.commit() # ย้าย commit เข้ามาใน with ด้วย
+
+        return {"success": True, "score": score, "total": len(rows), "items": items}
+    finally:
+        conn.close()
+
+@app.post("/labs/submit")
+def lab_submit(body: LabSubmitIn):
+    if not body.code.strip():
+        return {"success": False, "error": "ยังไม่มีโค้ด"}
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT 1 FROM lab WHERE id_lab=%s", (body.id_lab,))
+            if not c.fetchone():
+                return {"success": False, "error": "ไม่พบโจทย์ข้อนี้"}
+            c.execute(
+                "SELECT submitted_at FROM lab_submissions WHERE id_lab=%s AND user_id=%s",
+                (body.id_lab, body.user_id),
+            )
+            if c.fetchone():
+                return {"success": False, "error": "ส่ง Lab ข้อนี้ไปแล้ว", "already": True}
+            c.execute(
+                "INSERT INTO lab_submissions (id_lab, user_id, code, output) VALUES (%s,%s,%s,%s)",
+                (body.id_lab, body.user_id, body.code, body.output[:5000]),
+            )
+        conn.commit()
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+
+@app.get("/labs/{id_lab}/submission/{user_id}")
+def lab_submission_status(id_lab: int, user_id: int):
+    """นักเรียนคนนี้ส่งข้อนี้แล้วหรือยัง + ผลตรวจจากอาจารย์"""
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                SELECT s.code, s.submitted_at, r.score, r.comment
+                FROM lab_submissions s
+                LEFT JOIN lab_reviews r ON r.submission_id = s.id
+                WHERE s.id_lab = %s AND s.user_id = %s
+                ORDER BY s.id DESC
+                LIMIT 1
+                """,
+                (id_lab, user_id),
+            )
+            row = c.fetchone()
+        if not row:
+            return {"success": True, "submitted": False}
+        return {
+            "success": True,
+            "submitted": True,
+            "code": row["code"],
+            "submitted_at": str(row["submitted_at"]),
+            "score": float(row["score"]) if row["score"] is not None else None,
+            "comment": row["comment"],
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/labs/{id_lab}/submissions")
+def lab_submissions(id_lab: int):
+    """ฝั่งอาจารย์: ใครส่ง lab นี้แล้วบ้าง"""
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """SELECT u.user_id, u.name, u.id_student, s.submitted_at
+                   FROM lab_submissions s JOIN users u ON u.user_id = s.user_id
+                   WHERE s.id_lab = %s ORDER BY s.submitted_at""",
+                (id_lab,),
+            )
+            return {"success": True, "data": [
+                {**r, "submitted_at": str(r["submitted_at"])} for r in c.fetchall()
+            ]}
+    finally:
+        conn.close()
+
+@app.get("/labs/history/{user_id}")
+def lab_history(user_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                SELECT l.id_lab, l.namelab, l.detail,
+                       ch.id AS chapter_id, ch.chapter_no, ch.title AS chapter_title,
+                       s.submitted_at
+                FROM lab l
+                JOIN chapters ch ON ch.id = l.labchapter
+                LEFT JOIN lab_submissions s
+                       ON s.id_lab = l.id_lab AND s.user_id = %s
+                ORDER BY ch.id, l.id_lab
+                """,
+                (user_id,),
+            )
+            rows = c.fetchall()
+        return {"success": True, "data": [
+            {**r, "submitted_at": str(r["submitted_at"]) if r["submitted_at"] else None}
+            for r in rows
+        ]}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+@app.get("/teacher/my-classes")
+def teacher_my_classes(email: str):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            # หา user จากอีเมล ต้องเป็นอาจารย์ (role = 1)
+            cur.execute(
+                "SELECT user_id FROM users WHERE email = %s AND role = 1",
+                (email,),
+            )
+            t = cur.fetchone()
+            if not t:
+                raise HTTPException(status_code=403, detail="ไม่พบบัญชีอาจารย์ผู้สอน")
+
+            uid = t["user_id"]
+            cur.execute(
+                """
+                SELECT cg.id, cg.group_name, cg.term, cg.course_title,
+                  (SELECT COUNT(*) FROM enrollments e
+                    WHERE e.class_group_id = cg.id) AS student_count,
+                  (SELECT COUNT(DISTINCT ls.user_id)
+                     FROM lab_submissions ls
+                     JOIN enrollments e2 ON e2.user_id = ls.user_id
+                    WHERE e2.class_group_id = cg.id) AS submitted_count
+                FROM class_groups cg
+                WHERE cg.teacher_id = %s OR cg.assistant_id = %s
+                ORDER BY cg.term, cg.group_name
+                """,
+                (uid, uid),
+            )
+            return {"success": True, "data": cur.fetchall()}
+    finally:
+        conn.close()
+
+@app.get("/teacher/class/{class_id}/students")
+def teacher_class_students(class_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, group_name, term, course_title, join_code FROM class_groups WHERE id = %s",
+                (class_id,),
+            )
+            cls = cur.fetchone()
+            if not cls:
+                return {"success": False, "error": "ไม่พบห้องเรียน"}
+
+            cur.execute(
+                """
+                SELECT u.user_id, u.id_student, u.name, u.email, u.picture, e.joined_at
+                FROM enrollments e
+                JOIN users u ON u.user_id = e.user_id
+                WHERE e.class_group_id = %s
+                ORDER BY e.joined_at
+                """,
+                (class_id,),
+            )
+            rows = cur.fetchall()
+
+        students = []
+        verified = 0
+        for r in rows:
+            # สมมติ: ถือว่า Verified เมื่อนักเรียนกรอกรหัสนักศึกษาแล้ว (users.id_student ไม่ว่าง)
+            is_verified = bool(r["id_student"])
+            if is_verified:
+                verified += 1
+            students.append({
+                "user_id": r["user_id"],
+                "id_student": r["id_student"] or "",
+                "name": r["name"] or "",
+                "email": r["email"],
+                "picture": r["picture"] or "",
+                "status": "Verified" if is_verified else "Pending",
+                "joined_at": str(r["joined_at"]),
+            })
+
+        return {
+            "success": True,
+            "class": cls,
+            "total": len(students),
+            "verified": verified,
+            "pending": len(students) - verified,
+            "students": students,
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+
+class JoinCodeBody(BaseModel):
+    join_code: str
+
+@app.put("/teacher/class/{class_id}/join-code")
+def update_join_code(class_id: int, body: JoinCodeBody):
+    code = body.join_code.strip()
+
+    # ต้องเป็นตัวเลข 4 หลักเท่านั้น
+    if not re.fullmatch(r"\d{4}", code):
+        return {"success": False, "error": "รหัสต้องเป็นตัวเลข 4 หลัก"}
+
+    conn = get_conn()  # ใช้ตัวเดียวกับที่โปรเจกต์ใช้จริง
+    try:
+        cur = conn.cursor()
+
+        # เช็กว่ามีกลุ่มเรียนนี้จริง
+        cur.execute("SELECT id FROM class_groups WHERE id = %s", (class_id,))
+        if not cur.fetchone():
+            return {"success": False, "error": "ไม่พบกลุ่มเรียน"}
+
+        # กันรหัสซ้ำกับห้องอื่น
+        cur.execute(
+            "SELECT id FROM class_groups WHERE join_code = %s AND id <> %s",
+            (code, class_id),
+        )
+        if cur.fetchone():
+            return {"success": False, "error": "รหัสนี้ถูกใช้แล้ว กรุณาสุ่มใหม่"}
+
+        cur.execute(
+            "UPDATE class_groups SET join_code = %s WHERE id = %s",
+            (code, class_id),
+        )
+        conn.commit()
+        return {"success": True, "join_code": code}
+    finally:
+        conn.close()
+
+
+class AddStudentBody(BaseModel):
+    full_name: str
+    id_student: str = ""
+    email: str
+
+
+@app.post("/teacher/class/{class_id}/students")
+def add_student_to_class(class_id: int, body: AddStudentBody):
+    name = body.full_name.strip()
+    id_student = body.id_student.strip()
+    email = body.email.strip().lower()
+
+    if not name or not email or "@" not in email:
+        return {"success": False, "error": "กรุณากรอกชื่อและอีเมลให้ถูกต้อง"}
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+
+        cur.execute("SELECT id FROM class_groups WHERE id = %s", (class_id,))
+        if not cur.fetchone():
+            return {"success": False, "error": "ไม่พบกลุ่มเรียน"}
+
+        # ค้นหาแบบไม่สนพิมพ์เล็ก/ใหญ่ + ตัดช่องว่าง
+        cur.execute(
+            "SELECT user_id, role FROM users WHERE LOWER(TRIM(email)) = %s",
+            (email,),
+        )
+        row = cur.fetchone()
+        created = False
+
+        if row:
+            uid = row["user_id"] if isinstance(row, dict) else row[0]
+            role = row["role"] if isinstance(row, dict) else row[1]
+            if role != 0:
+                return {
+                    "success": False,
+                    "error": "อีเมลนี้เป็นบัญชีอาจารย์/ผู้ดูแล ไม่สามารถเพิ่มเป็นนักศึกษาได้",
+                }
+        else:
+            if id_student:
+                cur.execute(
+                    "SELECT user_id FROM users WHERE id_student = %s", (id_student,)
+                )
+                if cur.fetchone():
+                    return {"success": False, "error": "รหัสนักศึกษานี้ถูกใช้แล้ว"}
+
+            try:
+                cur.execute(
+                    "INSERT INTO users (google_id, email, name, id_student, role, created_at) "
+                    "VALUES (NULL, %s, %s, %s, 0, NOW())",
+                    (email, name, id_student or None),
+                )
+                uid = cur.lastrowid
+                created = True
+            except pymysql.err.IntegrityError as ie:
+                # ถ้า INSERT ชนแม้ SELECT ไม่เจอ (เช่น case/space) → ดึงมาใช้
+                conn.rollback()
+                cur.execute(
+                    "SELECT user_id FROM users WHERE LOWER(TRIM(email)) = %s",
+                    (email,),
+                )
+                again = cur.fetchone()
+                if not again:
+                    return {
+                        "success": False,
+                        "error": f"เพิ่มนักศึกษาไม่สำเร็จ: {ie.args}",
+                    }
+                uid = again["user_id"] if isinstance(again, dict) else again[0]
+
+        cur.execute(
+            "SELECT id FROM enrollments WHERE user_id = %s AND class_group_id = %s",
+            (uid, class_id),
+        )
+        if cur.fetchone():
+            conn.rollback()
+            return {"success": False, "error": "นักศึกษาคนนี้อยู่ในห้องนี้แล้ว"}
+
+        cur.execute(
+            "INSERT INTO enrollments (user_id, class_group_id, joined_at) VALUES (%s, %s, NOW())",
+            (uid, class_id),
+        )
+        conn.commit()
+        return {"success": True, "user_id": uid, "created": created}
+    except Exception as e:
+        conn.rollback()
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+@app.get("/teacher/labs")
+def list_labs():
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT l.id_lab, l.labchapter, l.namelab,
+                   c.id AS chapter_id,
+                   s.section_id, s.name AS section_name,
+                   t.id_term, t.term
+            FROM lab l
+            JOIN chapters c ON c.id = l.lab_ofchapter
+            JOIN sections s ON s.section_id = c.section_id
+            JOIN term t     ON t.id_term = s.id_term
+            ORDER BY t.id_term, s.sort_order, l.labchapter, l.id_lab
+        """)
+        rows = cur.fetchall()
+        # ถ้า cursor คืน tuple (ไม่ใช่ dict) ให้ใช้ map ด้านล่างแทน
+        return {"success": True, "labs": rows}
+    finally:
+        conn.close()
+
+@app.get("/teacher/labs/{id_lab}/submissions")
+def lab_submissions(id_lab: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT id_lab, labchapter, namelab FROM lab WHERE id_lab = %s",
+                (id_lab,),
+            )
+            lab = c.fetchone()
+            if not lab:
+                return {"success": False, "error": "ไม่พบใบงาน"}
+
+            c.execute(
+                """
+                SELECT u.user_id, u.id_student, u.name, u.picture,
+                       s.submitted_at
+                FROM enrollments e
+                JOIN users u ON u.user_id = e.user_id
+                LEFT JOIN lab_submissions s
+                       ON s.user_id = u.user_id
+                      AND s.id = (SELECT MAX(id) FROM lab_submissions
+                                  WHERE user_id = u.user_id AND id_lab = %s)
+                ORDER BY u.id_student
+                """,
+                (id_lab,),
+            )
+            students = c.fetchall()
+        return {"success": True, "lab": lab, "students": students}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+from pydantic import BaseModel, Field
+from typing import Optional
+
+
+class ReviewIn(BaseModel):
+    score: Optional[float] = Field(None, ge=0, le=10)
+    comment: Optional[str] = None
+
+@app.get("/teacher/labs/{id_lab}/submissions/{user_id}")
+def student_submission(id_lab: int, user_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                SELECT s.id, s.code, s.output, s.submitted_at,
+                       u.name, u.id_student, u.picture,
+                       r.score, r.comment
+                FROM lab_submissions s
+                JOIN users u ON u.user_id = s.user_id
+                LEFT JOIN lab_reviews r ON r.submission_id = s.id
+                WHERE s.id_lab = %s AND s.user_id = %s
+                ORDER BY s.id DESC
+                LIMIT 1
+                """,
+                (id_lab, user_id),
+            )
+            row = c.fetchone()
+        if not row:
+            return {"success": False, "error": "ไม่พบงานที่ส่ง"}
+        return {"success": True, "submission": row}
+    except Exception as e:
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+@app.put("/teacher/labs/{id_lab}/submissions/{user_id}/review")
+def save_review(id_lab: int, user_id: int, body: ReviewIn):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT id FROM lab_submissions WHERE id_lab=%s AND user_id=%s "
+                "ORDER BY id DESC LIMIT 1",
+                (id_lab, user_id),
+            )
+            sub = c.fetchone()
+            if not sub:
+                return {"success": False, "error": "ไม่พบงานที่ส่ง"}
+            c.execute(
+                """
+                INSERT INTO lab_reviews (submission_id, id_lab, user_id, score, comment)
+                VALUES (%s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE score = VALUES(score), comment = VALUES(comment)
+                """,
+                (sub["id"], id_lab, user_id, body.score, (body.comment or "").strip() or None),
+            )
+        conn.commit()
+        return {"success": True}
+    except Exception as e:
+        conn.rollback()
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+@app.get("/student/scores/{user_id}")
+def get_student_scores(user_id: int, section_filter: str = "all"):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            # เพิ่ม JOIN enrollments เพื่อดึงเฉพาะวิชาที่ นศ. คนนี้ลงทะเบียนไว้
+            sql = """
+                SELECT 
+                    c.id AS chapter_id, c.chapter_no, c.title,
+                    s.name AS section_name,
+                    q.score AS quiz_score, q.total AS quiz_total,
+                    (SELECT COALESCE(SUM(r.score), 0) FROM lab_submissions ls 
+                     LEFT JOIN lab_reviews r ON r.submission_id = ls.id
+                     WHERE ls.id_lab IN (SELECT id_lab FROM lab WHERE lab_ofchapter = c.id) AND ls.user_id = %s) AS lab_score,
+                    (SELECT COUNT(*) * 10 FROM lab WHERE lab_ofchapter = c.id) AS lab_max_score,
+                    (SELECT COUNT(DISTINCT ls.id_lab) FROM lab_submissions ls 
+                     WHERE ls.id_lab IN (SELECT id_lab FROM lab WHERE lab_ofchapter = c.id) AND ls.user_id = %s) AS submitted_labs,
+                    (SELECT COUNT(*) FROM lab WHERE lab_ofchapter = c.id) AS total_labs
+                FROM chapters c
+                JOIN sections s ON s.section_id = c.section_id
+                JOIN class_groups cg ON cg.id = s.class_group_id
+                JOIN enrollments e ON e.class_group_id = cg.id
+                LEFT JOIN quiz_submissions q ON q.chapter_id = c.id AND q.user_id = %s
+                WHERE e.user_id = %s
+            """
+            params = [user_id, user_id, user_id, user_id]
+            
+            if section_filter == "midterm":
+                sql += " AND s.name LIKE %s"
+                params.append("%กลางภาค%")
+            elif section_filter == "final":
+                sql += " AND s.name LIKE %s"
+                params.append("%ปลายภาค%")
+                
+            sql += " ORDER BY c.chapter_no"
+            
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+        return {"success": True, "chapters": rows}
+    finally:
+        conn.close()
+
+# # =====================================================
+# #  อัปเดตโปรไฟล์นักศึกษา (ชื่อ, นามสกุล, อีเมล, รูปภาพ)
+# # =====================================================
+# AVATAR_UPLOAD_DIR = os.path.join(UPLOAD_DIR, "avatars")
+# os.makedirs(AVATAR_UPLOAD_DIR, exist_ok=True)
+# app.mount("/uploads/avatars", StaticFiles(directory=AVATAR_UPLOAD_DIR), name="avatars")
+
+# from fastapi import Request # 👈 เช็กว่ามี import ตัวนี้ที่ด้านบนไฟล์แล้ว
+
+# @app.put("/student/profile/{user_id}")
+# def update_student_profile(
+#     request: Request, # 👈 เพิ่ม request เข้ามา
+#     user_id: int,
+#     first_name: str = Form(...),
+#     last_name: str = Form(...),
+#     email: str = Form(...),
+#     file: UploadFile = File(None)
+# ):
+#     conn = get_conn()
+#     try:
+#         with conn.cursor() as c:
+#             full_name = f"{first_name.strip()} {last_name.strip()}".strip()
+            
+#             pic_db_path = None   # เก็บลง DB เป็น relative path
+#             pic_full_url = None  # ส่งกลับไปให้ Frontend เป็น full URL
+
+#             if file and file.filename:
+#                 ext = os.path.splitext(file.filename)[1].lower()
+#                 if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+#                     return {"success": False, "error": "รองรับเฉพาะไฟล์รูปภาพ .jpg .png .webp"}
+                
+#                 filename = f"avatar_{user_id}_{uuid.uuid4().hex[:6]}{ext}"
+#                 filepath = os.path.join(AVATAR_UPLOAD_DIR, filename)
+#                 with open(filepath, "wb") as f:
+#                     f.write(file.file.read())
+                
+#                 # สร้าง Path ทั้ง 2 แบบ
+#                 pic_db_path = f"/uploads/avatars/{filename}"
+#                 # ดึง Base URL อัตโนมัติ (เช่น http://localhost:8000)
+#                 base_url = str(request.base_url).rstrip("/")
+#                 pic_full_url = f"{base_url}{pic_db_path}"
+
+#             # อัปเดตลง Database
+#             if pic_db_path:
+#                 c.execute(
+#                     "UPDATE users SET name=%s, email=%s, picture=%s WHERE user_id=%s",
+#                     (full_name, email.strip(), pic_db_path, user_id)
+#                 )
+#             else:
+#                 c.execute(
+#                     "UPDATE users SET name=%s, email=%s WHERE user_id=%s",
+#                     (full_name, email.strip(), user_id)
+#                 )
+#         conn.commit()
+        
+#         # 👇 ส่ง pic_full_url กลับไป
+#         return {"success": True, "picture_url": pic_full_url}
+        
+#     except Exception as e:
+#         conn.rollback()
+#         return {"success": False, "error": f"Database Error: {str(e)}"}
+#     finally:
+#         conn.close()
+
+
+
+# ----------------- เพิ่ม API สำหรับ แก้ไข / ลบ / ดึงข้อมูลอาจารย์รายคน -----------------
+
+@app.get("/admin/teachers/{teacher_id}")
+def get_teacher(teacher_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute("SELECT user_id AS id, name, email FROM users WHERE user_id = %s AND role = 1", (teacher_id,))
+            row = cur.fetchone()
+        if not row:
+            return {"success": False, "error": "ไม่พบข้อมูลอาจารย์"}
+        return {"success": True, "data": row}
+    finally:
+        conn.close()
+
+class UpdateTeacherBody(BaseModel):
+    name: str
+    surname: str
+    email: str
+
+@app.put("/admin/teachers/{teacher_id}")
+def update_teacher(teacher_id: int, body: UpdateTeacherBody):
+    full_name = f"{body.name.strip()} {body.surname.strip()}".strip()
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            # ตรวจสอบว่าอีเมลซ้ำกับคนอื่นไหม
+            cur.execute("SELECT user_id FROM users WHERE email = %s AND user_id <> %s", (body.email.strip(), teacher_id))
+            if cur.fetchone():
+                return {"success": False, "error": "อีเมลนี้ถูกใช้งานโดยบัญชีอื่นแล้ว"}
+            
+            cur.execute(
+                "UPDATE users SET name = %s, email = %s WHERE user_id = %s AND role = 1",
+                (full_name, body.email.strip(), teacher_id)
+            )
+        conn.commit()
+        return {"success": True}
+    except Exception as e:
+        conn.rollback()
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+@app.delete("/admin/teachers/{teacher_id}")
+def delete_teacher(teacher_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            # เช็กก่อนว่าอาจารย์คนนี้ถูก Assign ไปสอนห้องไหนอยู่ไหม (กัน Foreign Key Error)
+            cur.execute("SELECT id FROM class_groups WHERE teacher_id = %s OR assistant_id = %s LIMIT 1", (teacher_id, teacher_id))
+            if cur.fetchone():
+                return {"success": False, "error": "ลบไม่ได้! อาจารย์คนนี้กำลังสอนหรือเป็นผู้ช่วยในกลุ่มเรียนอยู่"}
+
+            cur.execute("DELETE FROM users WHERE user_id = %s AND role = 1", (teacher_id,))
+        conn.commit()
+        return {"success": True}
+    except Exception as e:
+        conn.rollback()
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+# ----------------- เพิ่ม API สำหรับ แก้ไข / ลบ / ดึงข้อมูลกลุ่มเรียน -----------------
+
+@app.get("/admin/class-groups/{group_id}")
+def get_class_group(group_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM class_groups WHERE id = %s", (group_id,))
+            row = cur.fetchone()
+        if not row:
+            return {"success": False, "error": "ไม่พบข้อมูลกลุ่มเรียน"}
+        return {"success": True, "data": row}
+    finally:
+        conn.close()
+
+class UpdateGroupBody(BaseModel):
+    term: str
+    group_name: str
+    detail: str
+    teacher_id: int
+    assistant_id: Optional[int] = None
+
+@app.put("/admin/class-groups/{group_id}")
+def update_class_group(group_id: int, body: UpdateGroupBody):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            # ดึงชื่ออาจารย์ผู้สอน
+            cur.execute("SELECT name FROM users WHERE user_id = %s AND role = 1", (body.teacher_id,))
+            t = cur.fetchone()
+            if not t: return {"success": False, "error": "ไม่พบอาจารย์ผู้สอน"}
+            teacher_name = t["name"]
+
+            # ดึงชื่อผู้ช่วยสอน (ถ้ามี)
+            assistant_name = None
+            if body.assistant_id:
+                cur.execute("SELECT name FROM users WHERE user_id = %s AND role = 1", (body.assistant_id,))
+                a = cur.fetchone()
+                if a: assistant_name = a["name"]
+
+            cur.execute(
+                """
+                UPDATE class_groups 
+                SET term = %s, group_name = %s, course_title = %s, 
+                    teacher_id = %s, teacher_name = %s, 
+                    assistant_id = %s, teacher_assist = %s
+                WHERE id = %s
+                """,
+                (body.term, body.group_name, body.detail, 
+                 body.teacher_id, teacher_name, 
+                 body.assistant_id, assistant_name, group_id)
+            )
+        conn.commit()
+        return {"success": True}
+    except Exception as e:
+        conn.rollback()
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+@app.delete("/admin/class-groups/{group_id}")
+def delete_class_group(group_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            # เช็กว่ามีนักศึกษาหรือยัง (ตาราง enrollments)
+            cur.execute("SELECT id FROM enrollments WHERE class_group_id = %s LIMIT 1", (group_id,))
+            if cur.fetchone():
+                return {"success": False, "error": "ลบไม่ได้! มีนักศึกษาอยู่ในกลุ่มนี้แล้ว"}
+
+            # ลบข้อมูล
+            cur.execute("DELETE FROM class_groups WHERE id = %s", (group_id,))
+        conn.commit()
+        return {"success": True}
+    except Exception as e:
+        conn.rollback()
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+# ----------------- เพิ่ม API สำหรับ แก้ไข / ลบ / ดึงข้อมูลใบงาน -----------------
+
+@app.get("/admin/labs/{lab_id}")
+def get_single_lab(lab_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM lab WHERE id_lab = %s", (lab_id,))
+            row = c.fetchone()
+        if not row:
+            return {"success": False, "error": "ไม่พบข้อมูลใบงาน"}
+        return {"success": True, "data": row}
+    finally:
+        conn.close()
+
+class UpdateLabBody(BaseModel):
+    namelab: str
+    detail: str
+    chapter_id: int
+    chapter_no: int
+
+@app.put("/admin/labs/{lab_id}")
+def update_lab(lab_id: int, body: UpdateLabBody):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                UPDATE lab 
+                SET namelab = %s, detail = %s, labchapter = %s, lab_ofchapter = %s 
+                WHERE id_lab = %s
+                """,
+                (body.namelab, body.detail, body.chapter_no, body.chapter_id, lab_id)
+            )
+        conn.commit()
+        return {"success": True}
+    except Exception as e:
+        conn.rollback()
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+@app.delete("/admin/labs/{lab_id}")
+def delete_lab(lab_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            # เช็กก่อนว่ามีนักศึกษาส่งงานข้อนี้แล้วหรือยัง ถ้ามีห้ามลบ
+            c.execute("SELECT id FROM lab_submissions WHERE id_lab = %s LIMIT 1", (lab_id,))
+            if c.fetchone():
+                return {"success": False, "error": "ลบไม่ได้! มีนักศึกษาส่งงานใบงานนี้แล้ว"}
+            
+            c.execute("DELETE FROM lab WHERE id_lab = %s", (lab_id,))
+        conn.commit()
+        return {"success": True}
+    except Exception as e:
+        conn.rollback()
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+# ----------------- เพิ่ม API สำหรับ แก้ไข / ลบ / ดึงข้อมูลโจทย์ -----------------
+
+@app.get("/admin/quiz-questions/{question_id}")
+def get_single_quiz(question_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM quiz_questions WHERE question_id = %s", (question_id,))
+            row = c.fetchone()
+        if not row:
+            return {"success": False, "error": "ไม่พบข้อมูลโจทย์"}
+        return {"success": True, "data": row}
+    finally:
+        conn.close()
+
+@app.delete("/admin/quiz-questions/{question_id}")
+def delete_quiz(question_id: int):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("DELETE FROM quiz_questions WHERE question_id = %s", (question_id,))
+        conn.commit()
+        return {"success": True}
+    except Exception as e:
+        conn.rollback()
+        return {"success": False, "error": f"Database Error: {str(e)}"}
+    finally:
+        conn.close()
+
+@app.put("/admin/quiz-questions/{question_id}")
+def update_quiz_question(
+    question_id: int,
+    chapter_id: int = Form(...),
+    question: str = Form(...),
+    choice_type: str = Form("text"),
+    choice_a: str = Form(""),
+    choice_b: str = Form(""),
+    choice_c: str = Form(""),
+    choice_d: str = Form(""),
+    correct_choice: str = Form(...),
+    explanation: str = Form(""),
+    explanation_wrong: str = Form(""),
+    existing_image: str = Form(""),
+    image: UploadFile | None = File(None),
+    choice_image_a: UploadFile | None = File(None),
+    choice_image_b: UploadFile | None = File(None),
+    choice_image_c: UploadFile | None = File(None),
+    choice_image_d: UploadFile | None = File(None),
+):
+    if choice_type not in ("text", "image"):
+        return {"success": False, "error": "ชนิดตัวเลือกไม่ถูกต้อง"}
+
+    saved = [] 
+    def cleanup():
+        for n in saved:
+            try: os.remove(os.path.join(QUIZ_UPLOAD_DIR, n))
+            except OSError: pass
+
+    # จัดการรูปโจทย์
+    image_file = existing_image if existing_image else None
+    if image and image.filename:
+        name, err = save_quiz_image(image)
+        if err: return {"success": False, "error": err}
+        if name: 
+            image_file = name
+            saved.append(name)
+
+    choices = {"a": choice_a, "b": choice_b, "c": choice_c, "d": choice_d}
+
+    # จัดการตัวเลือกแบบรูปภาพ
+    if choice_type == "image":
+        for letter, f in (("a", choice_image_a), ("b", choice_image_b),
+                          ("c", choice_image_c), ("d", choice_image_d)):
+            # ถ้ามีอัปโหลดใหม่
+            if f and f.filename:
+                name, err = save_quiz_image(f)
+                if err: 
+                    cleanup()
+                    return {"success": False, "error": err}
+                if name:
+                    saved.append(name)
+                    choices[letter] = name
+            # ถ้าไม่อัปโหลดใหม่ ให้ใช้ค่าเดิม (ที่ frontend ส่งมาใน choice_a-d)
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """UPDATE quiz_questions 
+                   SET chapter_id=%s, question=%s, choice_type=%s, choice_a=%s, choice_b=%s, 
+                       choice_c=%s, choice_d=%s, correct_choice=%s, image_file=%s, 
+                       explanation=%s, explanation_wrong=%s
+                   WHERE question_id=%s""",
+                (chapter_id, question, choice_type, choices["a"], choices["b"], choices["c"],
+                 choices["d"], correct_choice, image_file, explanation, explanation_wrong, question_id),
+            )
+        conn.commit()
+        return {"success": True}
+    except Exception as e:
+        cleanup()
+        return {"success": False, "error": f"Database Error: {str(e)}"}
     finally:
         conn.close()
