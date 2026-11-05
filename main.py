@@ -1270,10 +1270,10 @@ def list_train_pdfs():
 # =====================================================
 TRAIN_DIR = os.path.join(UPLOAD_DIR, "trainAI")
 
-MAX_DOC_CHARS = 700000      # ข้อความรวมที่ส่งให้ AI ยิ่งน้อยยิ่งเร็ว (เดิม 700000)
-MAX_IMAGES = 10             # จำนวนภาพแนบสูงสุด (เดิม 8)
+MAX_DOC_CHARS = 60000      # ข้อความรวมที่ส่งให้ AI ยิ่งน้อยยิ่งเร็ว (เดิม 700000)
+MAX_IMAGES = 10            # จำนวนภาพแนบสูงสุด (เดิม 8)
 IMAGE_DPI = 80             # ความละเอียดภาพ (เดิม 110)
-GEMINI_TIMEOUT = (10, 60)  # (รอเชื่อมต่อ, รอคำตอบ) วินาที ต่อ 1 โมเดล (เดิม 180)
+GEMINI_TIMEOUT = (10, 120)  # (รอเชื่อมต่อ, รอคำตอบ) วินาที ต่อ 1 โมเดล (เดิม 180)
 
 # ตัวควบอักษร (ligature) ใน PDF เช่น ﬃ ให้แปลงกลับเป็น ffi
 # ห้ามใช้ NFKC เพราะจะทำให้สระ "ำ" ในภาษาไทยเพี้ยน
@@ -1436,16 +1436,99 @@ def render_image_pages(pdf_path, max_images, first_page, last_page):
 
 def thinking_config(model):
     """ปิด/ลดการคิดของโมเดลเพื่อให้ตอบเร็ว"""
-    if "gemini-3" in model:
-        return {"thinkingLevel": "minimal"}
     if "2.5" in model and "pro" not in model:
         return {"thinkingBudget": 0}
     return None
 
 
-def call_gemini_quiz(prompt, images):
-    """ส่งข้อความ + ภาพ ให้ Gemini ตอบเป็น JSON คืน (ข้อความ, error)
-    ถ้าโมเดลไหนล่ม (503/429 ฯลฯ) ข้ามไปโมเดลถัดไปทันที แล้วลองอีก 1 รอบ"""
+def call_gemma_local(prompt, images):
+    """fallback: ยิงทีละข้อเพื่อความชัวร์"""
+    import re, random  # 👈 import random เพิ่ม
+    
+    # หาจำนวนข้อจาก prompt เช่น "จำนวน 10 ข้อ"
+    match = re.search(r'จำนวน (\d+) ข้อ', prompt)
+    count = int(match.group(1)) if match else 10
+
+    # ดึงเอกสารออกมา
+    head, sep, doc = prompt.partition("===== เอกสาร =====")
+    doc_text = doc[:4000]  # ตัดแค่ 4000 ตัวอักษร
+
+    all_questions = []
+    seen_questions = set() # 👈 ตัวแปรเก็บโจทย์ที่เคยสร้างไปแล้ว
+    
+    print(f"🤖 กำลังใช้ Gemma สร้างข้อสอบทีละข้อ ({count} ข้อ)...")
+    
+    attempts = 0
+    # 👇 เปลี่ยนจาก for เป็น while เพื่อให้มันสร้างจนกว่าจะครบ (หรือจนกว่าจะพยายามเกิน 2 เท่า)
+    while len(all_questions) < count and attempts < count * 2:
+        attempts += 1
+        
+        single_prompt = f"""คุณเป็นอาจารย์ภาษา C จงออกข้อสอบปรนัย 1 ข้อ จากเนื้อหาด้านล่าง
+สร้างข้อสอบที่แตกต่างจากเดิมโดยสิ้นเชิง (ห้ามถามซ้ำประเด็นเดิม)
+ตอบเป็น JSON object เดี่ยวๆ เท่านั้น (ไม่ต้องมี [ ] ครอบ) โดยมีฟิลด์:
+"question": โจทย์,
+"choices": [ตัวเลือก 4 ข้อ],
+"answer": ลำดับตัวเลือกที่ถูก (เริ่มที่ 0),
+"explanation": อธิบายข้อถูก,
+"explanation_wrong": อธิบายข้อผิด
+
+เอกสาร:
+{doc_text}
+"""
+        try:
+            print(f"  - กำลังสร้างข้อที่ {len(all_questions) + 1}/{count}...")
+            res = ollama.chat(
+                model="gemma3:4b",
+                messages=[{"role": "user", "content": single_prompt}],
+                format="json",
+                options={
+                    "temperature": 0.8,  # 👈 เพิ่มความสร้างสรรค์
+                    "seed": random.randint(1, 999999), # 👈 บังคับให้ Random ผลลัพธ์ใหม่ทุกครั้ง
+                    "num_ctx": 4096, 
+                    "num_predict": 1000
+                },
+            )
+            text = res["message"]["content"].strip()
+            
+            # ซ่อม JSON ถ้าจำเป็น
+            raw_json = ""
+            if text.startswith("{") and text.endswith("}"):
+                raw_json = text
+            else:
+                match_obj = re.search(r'\{.*\}', text, re.DOTALL)
+                if match_obj:
+                    raw_json = match_obj.group(0)
+            
+            # 👇 เช็กว่าซ้ำกับข้อเก่าที่สร้างไปแล้วหรือเปล่า
+            if raw_json:
+                import json
+                try:
+                    parsed = json.loads(raw_json)
+                    q_text = parsed.get("question", "").strip()
+                    if q_text in seen_questions:
+                        print(f"    ⚠️ โจทย์ซ้ำ (ข้าม): {q_text[:30]}...")
+                        continue # ถ้าซ้ำ ให้วนลูปใหม่
+                    
+                    seen_questions.add(q_text)
+                    all_questions.append(raw_json)
+                except:
+                    pass
+                    
+        except Exception as e:
+            print(f"  ❌ ข้อที่ {len(all_questions) + 1} ล้มเหลว: {e}")
+
+    if not all_questions:
+        return "", "Gemma สร้างไม่ได้เลย"
+
+    # รวมเป็น JSON Array
+    combined = "[" + ",".join(all_questions) + "]"
+    return combined, ""
+
+
+
+
+def call_gemini_quiz(prompt, images, is_image_mode=False):
+    """ส่งข้อความ + ภาพ ให้ Gemini ตอบเป็น JSON คืน (ข้อความ, error)"""
     parts = [{"text": prompt}]
     for ref, img in images:
         parts.append({"text": f"ภาพของหน้า {ref}:"})
@@ -1461,7 +1544,6 @@ def call_gemini_quiz(prompt, images):
         for model in GEMINI_MODELS:
             think = thinking_config(model)
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-            # ลองพร้อม thinkingConfig ก่อน ถ้า 400 (โมเดลไม่รองรับ) ลองซ้ำแบบไม่ใส่
             for use_think in ((True, False) if think else (False,)):
                 gen = {"temperature": 0.3, "responseMimeType": "application/json"}
                 if use_think:
@@ -1475,7 +1557,7 @@ def call_gemini_quiz(prompt, images):
                 except Exception as e:
                     last_err = f"{model}: {type(e).__name__}"
                     print("Gemini quiz error:", last_err)
-                    break  # โมเดลถัดไป
+                    break
 
                 if r.status_code == 200:
                     try:
@@ -1484,8 +1566,7 @@ def call_gemini_quiz(prompt, images):
                     except (KeyError, IndexError, TypeError):
                         text = ""
                     if text:
-                        print(f"Gemini quiz OK: {model} thinking={'on' if use_think else 'off'} "
-                              f"ใช้เวลา {r.elapsed.total_seconds():.1f} วินาที")
+                        print(f"Gemini quiz OK: {model} thinking={'on' if use_think else 'off'} ใช้เวลา {r.elapsed.total_seconds():.1f} วินาที")
                         return text, ""
                     last_err = f"{model}: ตอบกลับว่าง"
                     break
@@ -1493,11 +1574,39 @@ def call_gemini_quiz(prompt, images):
                 last_err = f"{model}: HTTP {r.status_code}"
                 print("Gemini quiz error:", last_err, r.text[:200])
                 if r.status_code == 400 and use_think:
-                    continue  # ลองโมเดลเดิมอีกครั้งโดยไม่ใส่ thinkingConfig
+                    continue
                 if r.status_code in (401, 403):
-                    return "", last_err  # คีย์ผิด ลองต่อก็ไม่มีประโยชน์
-                break  # 503/429/อื่นๆ -> โมเดลถัดไปทันที
-    return "", last_err
+                    break
+                break
+
+    # =====================================================
+    # 👇 Fallback ไปใช้ Gemma 3 4B (ปรับ Prompt ให้เป็นข้อความล้วน)
+    # =====================================================
+    print("🚨 Gemini ล่มทั้งหมด! สลับไปใช้ Gemma 3 4B บนเครื่อง...")
+    
+    local_prompt = prompt
+    if is_image_mode:
+        # ถ้าเป็นโหมดรูปภาพ ให้เปลี่ยนคำสั่งเป็นเรื่องข้อความล้วน เพื่อไม่ให้ Gemma สับสน
+        local_prompt = local_prompt.replace(
+            "ทุกข้อต้องใช้ภาพ โดยออกผสมกัน 2 แบบ ประมาณครึ่งต่อครึ่ง:", 
+            "ให้ออกข้อสอบแบบตัวเลือกเป็นข้อความล้วน:"
+        )
+        import re
+        local_prompt = re.sub(r'  แบบ A.*?null\n', '', local_prompt)
+        local_prompt = re.sub(r'  แบบ B.*?null\n', '', local_prompt)
+        local_prompt = re.sub(r'ในแบบ B.*?B\n', '', local_prompt)
+        local_prompt = re.sub(r'ภาพเดียวกัน.*?ประเด็น\n', '', local_prompt)
+        local_prompt = local_prompt.replace('"image_ref": อ้างอิงภาพ (แบบ A) หรือ null,', '"image_ref": null,')
+        local_prompt = local_prompt.replace('"choice_images": [อ้างอิงภาพ...] (แบบ B) หรือ null', '"choice_images": null')
+        local_prompt += "\n(หมายเหตุระบบ: ให้สร้างข้อสอบแบบตัวเลือกเป็นข้อความล้วนเท่านั้น)"
+
+    text, err = call_gemma_local(local_prompt, []) # ไม่ต้องส่งรูปให้ Gemma แล้ว
+    if text:
+        print("✅ Gemma local ทำงานสำเร็จ")
+        return text, ""
+        
+    print("❌ Gemma local ล้มเหลว:", err)
+    return "", f"{last_err} | {err}"
 
 
 @app.post("/admin/quiz-ai/generate")
@@ -1513,8 +1622,6 @@ def generate_quiz_ai(data: dict):
     except (TypeError, ValueError):
         count = 10
 
-    # ชนิดตัวเลือกที่ครูเลือกในหน้าเพิ่มโจทย์
-    # text = ข้อความล้วน (ไม่ใช้รูปเลย) / image = ทุกข้อใช้รูป (โจทย์มีรูป + ตัวเลือกเป็นรูป)
     choice_type = data.get("choice_type", "text")
     if choice_type not in ("text", "image"):
         choice_type = "text"
@@ -1541,6 +1648,200 @@ def generate_quiz_ai(data: dict):
                 names.append(row["filename"])
     finally:
         conn.close()
+
+    # 2) ถอดข้อความ + เตรียมภาพ
+    doc_text = ""
+    images = []
+    budget = MAX_DOC_CHARS // len(names)
+    try:
+        for k, name in enumerate(names, start=1):
+            text, last_page = trim_pages(get_doc_text(name), budget, start_page)
+            doc_text += f"\n\n# ไฟล์ {k}: {name}\n" + text
+            if with_images and len(images) < MAX_IMAGES:
+                pdf_path = os.path.join(TRAIN_DIR, os.path.basename(name))
+                for page_no, idx, img in render_image_pages(
+                    pdf_path, MAX_IMAGES - len(images), start_page, last_page
+                ):
+                    ref = f"{k}:{page_no}" if idx == 0 else f"{k}:{page_no}.{idx + 1}"
+                    images.append((ref, img))
+    except Exception as e:
+        return {"success": False, "error": f"อ่านเอกสารไม่สำเร็จ: {str(e)}"}
+    t1 = time.time()
+
+    if image_mode and not images:
+        return {
+            "success": False,
+            "error": f"ไม่พบรูปภาพในเอกสารช่วงที่อ่าน (เริ่มหน้า {start_page}) "
+                     "ลองเปลี่ยนเอกสาร หรือเลือกตัวเลือกแบบข้อความ",
+        }
+
+    # 3) สร้าง prompt
+    if not image_mode:
+        prompt = (
+            f"คุณเป็นอาจารย์สอนภาษา C ออกข้อสอบปรนัยจำนวน {count} ข้อ จากเนื้อหาในเอกสารด้านล่างเท่านั้น\n"
+            "ตอบเป็นภาษาไทย ตัวเลือก 4 ข้อ (ข้อจริง/เท็จใช้ 2 ตัวเลือกได้) มีคำตอบถูกเพียงข้อเดียว\n"
+            "ไม่มีภาพแนบ ห้ามออกข้อที่ต้องดูรูป\n"
+            "ตอบเป็น JSON array เท่านั้น แต่ละข้อมีฟิลด์:\n"
+            '  "question": โจทย์,\n'
+            '  "choices": [ตัวเลือก...],\n'
+            '  "answer": ลำดับตัวเลือกที่ถูก เริ่มที่ 0,\n'
+            '  "explanation": อธิบายว่าทำไมข้อที่ถูกจึงถูก (สั้น 1-2 ประโยค),\n'
+            '  "explanation_wrong": อธิบายว่าข้อที่ผิดผิดเพราะอะไร (สั้น 1-2 ประโยค)\n'
+        )
+    else:
+        refs = ", ".join(ref for ref, _ in images)
+        prompt = (
+            f"คุณเป็นอาจารย์สอนภาษา C ออกข้อสอบปรนัยจำนวน {count} ข้อ จากเนื้อหาในเอกสารด้านล่างเท่านั้น\n"
+            "ตอบเป็นภาษาไทย มีคำตอบถูกเพียงข้อเดียว\n"
+            f"มีภาพจากเอกสารแนบมา (อ้างอิง: {refs} รูปแบบ ไฟล์:หน้า หรือ ไฟล์:หน้า.ลำดับรูป)\n"
+            "ทุกข้อต้องใช้ภาพ โดยออกผสมกัน 2 แบบ ประมาณครึ่งต่อครึ่ง:\n"
+            '  แบบ A (โจทย์มีรูปประกอบ): ใส่ "image_ref" เป็นอ้างอิงของภาพ เขียนโจทย์ให้อ้างถึง "ภาพที่แนบ" '
+            '"choices" เป็นข้อความ 4 ข้อ และ "choice_images" เป็น null\n'
+            '  แบบ B (ตัวเลือกเป็นรูป): ถามให้เลือกภาพที่ตรงกับคำอธิบาย (เช่น "ภาพใดแสดง ...") '
+            'ใส่ "choice_images" เป็นอ้างอิงของภาพ 2-4 ภาพที่ต่างกัน (ภาพที่ถูกต้องรวมอยู่ด้วย) '
+            '"choices" เป็น [] และ "image_ref" เป็น null\n'
+            "ในแบบ B ห้ามใช้ภาพเดียวกันซ้ำในข้อเดียวกัน ถ้ามีภาพแนบน้อยกว่า 2 ภาพ ห้ามออกแบบ B\n"
+            "ภาพเดียวกันใช้ซ้ำข้ามข้อได้ แต่ต้องถามคนละประเด็น\n"
+            "ตอบเป็น JSON array เท่านั้น แต่ละข้อมีฟิลด์:\n"
+            '  "question": โจทย์,\n'
+            '  "choices": [ตัวเลือกข้อความ...] (แบบ B ให้เป็น []),\n'
+            '  "answer": ลำดับตัวเลือกที่ถูก เริ่มที่ 0 (แบบ B นับตามลำดับใน choice_images),\n'
+            '  "explanation": อธิบายว่าทำไมข้อที่ถูกจึงถูก (สั้น 1-2 ประโยค),\n'
+            '  "explanation_wrong": อธิบายว่าข้อที่ผิดผิดเพราะอะไร (สั้น 1-2 ประโยค),\n'
+            '  "image_ref": อ้างอิงภาพ (แบบ A) หรือ null,\n'
+            '  "choice_images": [อ้างอิงภาพ...] (แบบ B) หรือ null\n'
+        )
+    prompt += f"\n===== เอกสาร =====\n{doc_text}"
+
+    # 4) เรียก Gemini/Groq/Gemma
+    # 👇 สำคัญมาก: ต้องส่ง is_image_mode ไปด้วย เพื่อให้ฟังก์ชันรู้ว่าต้องทำยังไงเวลา Fallback
+    text, err = call_gemini_quiz(prompt, images, is_image_mode=image_mode)
+    t2 = time.time()
+    
+    if not text:
+        return {"success": False, "error": f"AI ไม่ตอบกลับ ({err})"}
+
+    # =====================================================
+    # 5) ซ่อมแซมและแกะ JSON (ทนทานต่อ AI ตอบผิดรูปแบบ)
+    # =====================================================
+    text = text.strip()
+    text = text.replace("```json", "").replace("```", "").strip()
+    
+    # ถ้า AI ตอบเป็น Object เดี่ยวๆ มา ให้เติม [ ] ครอบให้เป็น Array
+    if text.startswith("{") and text.endswith("}"):
+        text = f"[{text}]"
+        
+    # ถ้ามีคำพูดอื่นปนมา ให้ใช้ Regex ดึงเฉพาะก้อน Array [ ... ]
+    if not text.startswith("[") or not text.endswith("]"):
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if match:
+            text = match.group(0)
+
+    try:
+        items = json.loads(text)
+    except Exception as e:
+        print("❌ JSON Parse Error:", e)
+        print("ข้อความที่ Parse ไม่ผ่าน (300 ตัวแรก):", text[:300])
+        return {"success": False, "error": "AI ตอบผิดรูปแบบ ไม่ใช่ JSON ที่ถูกต้อง"}
+
+    if isinstance(items, dict):
+        items = items.get("questions", items)
+
+    if not isinstance(items, list):
+        return {"success": False, "error": "AI ตอบผิดรูปแบบ (ไม่ใช่ List)"}
+
+    # =====================================================
+    # 6) ตรวจสอบข้อมูล (ผ่อนปรน ถ้า AI ไม่ส่งรูปมาก็ยอมให้เป็นข้อความ)
+    # =====================================================
+    img_by_ref = dict(images)
+    saved_img = {}
+
+    def save_ref(ref):
+        if ref not in saved_img:
+            os.makedirs(QUIZ_UPLOAD_DIR, exist_ok=True)
+            fname = uuid.uuid4().hex + ".jpg"
+            with open(os.path.join(QUIZ_UPLOAD_DIR, fname), "wb") as f:
+                f.write(img_by_ref[ref])
+            saved_img[ref] = fname
+        return saved_img[ref]
+
+    questions = []
+    for q in items:
+        if not isinstance(q, dict) or not q.get("question"):
+            continue
+            
+        # แปลง answer เป็น int เผื่อ AI ส่งมาเป็น String (เช่น "0" หรือ "1")
+        answer = q.get("answer")
+        if isinstance(answer, str) and answer.isdigit():
+            answer = int(answer)
+
+        base = {
+            "question": q["question"],
+            "explanation": q.get("explanation", ""),
+            "explanation_wrong": q.get("explanation_wrong", ""),
+        }
+
+        # แบบ B: ตัวเลือกเป็นรูป
+        refs_b = q.get("choice_images")
+        if image_mode and isinstance(refs_b, list) and refs_b:
+            ok = (
+                2 <= len(refs_b) <= 4
+                and all(isinstance(r, str) and r in img_by_ref for r in refs_b)
+                and len(set(refs_b)) == len(refs_b)
+                and isinstance(answer, int)
+                and 0 <= answer < len(refs_b)
+            )
+            if ok:
+                questions.append({
+                    **base,
+                    "choice_type": "image",
+                    "choices": [save_ref(r) for r in refs_b],
+                    "answer": answer,
+                    "image_file": None,
+                })
+            continue
+
+        # แบบ A และโหมดข้อความ
+        choices = q.get("choices")
+        if not isinstance(choices, list):
+            continue
+            
+        # แปลง choices เป็น string ทั้งหมด เผื่อ AI ส่งมาเป็นตัวเลข
+        choices = [str(c).strip() for c in choices]
+
+        if not (2 <= len(choices) <= 4) or not all(choices):
+            continue
+        if not isinstance(answer, int) or not (0 <= answer < len(choices)):
+            continue
+
+        image_file = None
+        if image_mode:
+            ref = q.get("image_ref")
+            # 👇 ถ้า AI หา ref ไม่เจอ ให้ยอมรับเป็นข้อความล้วนแทน ไม่ต้องตัดทิ้ง
+            if isinstance(ref, str) and ref in img_by_ref:
+                image_file = save_ref(ref)
+
+        questions.append({
+            **base,
+            "choice_type": "text",
+            "choices": choices,
+            "answer": answer,
+            "image_file": image_file,
+        })
+
+    print(f"[quiz-ai] โหมด {choice_type} | เริ่มหน้า {start_page} | ถอดข้อความ+เตรียมภาพ {t1 - t0:.1f}s | "
+          f"AI {t2 - t1:.1f}s | รวม {time.time() - t0:.1f}s | ภาพแนบ {len(images)} | "
+          f"ได้ {len(questions)} ข้อ")
+
+    if len(questions) == 0:
+        return {"success": False, "error": "AI สร้างข้อสอบไม่สำเร็จ หรือรูปแบบ JSON ผิดพลาดทั้งหมด"}
+
+    return {
+        "success": True,
+        "choice_type": choice_type,
+        "files": [os.path.basename(n).split("_", 1)[-1] for n in names],
+        "questions": questions,
+    }
 
     # 2) ถอดข้อความ (เริ่มจากหน้า start_page ตัดตามงบตัวอักษร) + ครอปรูปเฉพาะหน้าที่ส่งข้อความไป
     doc_text = ""
@@ -1616,11 +1917,21 @@ def generate_quiz_ai(data: dict):
     text = text.replace("```json", "").replace("```", "").strip()
     try:
         items = json.loads(text)
-    except Exception:
+    except Exception as e:
+        print("JSON parse error:", e)
         return {"success": False, "error": "AI ตอบผิดรูปแบบ ลองใหม่อีกครั้ง"}
+
+    # รองรับ {"questions":[...]} หรือ key อื่นที่เป็น list
     if isinstance(items, dict):
-        items = items.get("questions")
+        lst = items.get("questions")
+        if not isinstance(lst, list):
+            lst = next((v for v in items.values() if isinstance(v, list)), None)
+        # โมเดลเล็กอาจตอบข้อเดียวเป็น object
+        if lst is None and "question" in items:
+            lst = [items]
+        items = lst
     if not isinstance(items, list):
+        print("โครงสร้างไม่ใช่ list:", type(items))
         return {"success": False, "error": "AI ตอบผิดรูปแบบ ลองใหม่อีกครั้ง"}
 
     img_by_ref = dict(images)
@@ -2888,110 +3199,6 @@ def delete_lab(lab_id: int):
         return {"success": True}
     except Exception as e:
         conn.rollback()
-        return {"success": False, "error": f"Database Error: {str(e)}"}
-    finally:
-        conn.close()
-
-# ----------------- เพิ่ม API สำหรับ แก้ไข / ลบ / ดึงข้อมูลโจทย์ -----------------
-
-@app.get("/admin/quiz-questions/{question_id}")
-def get_single_quiz(question_id: int):
-    conn = get_conn()
-    try:
-        with conn.cursor() as c:
-            c.execute("SELECT * FROM quiz_questions WHERE question_id = %s", (question_id,))
-            row = c.fetchone()
-        if not row:
-            return {"success": False, "error": "ไม่พบข้อมูลโจทย์"}
-        return {"success": True, "data": row}
-    finally:
-        conn.close()
-
-@app.delete("/admin/quiz-questions/{question_id}")
-def delete_quiz(question_id: int):
-    conn = get_conn()
-    try:
-        with conn.cursor() as c:
-            c.execute("DELETE FROM quiz_questions WHERE question_id = %s", (question_id,))
-        conn.commit()
-        return {"success": True}
-    except Exception as e:
-        conn.rollback()
-        return {"success": False, "error": f"Database Error: {str(e)}"}
-    finally:
-        conn.close()
-
-@app.put("/admin/quiz-questions/{question_id}")
-def update_quiz_question(
-    question_id: int,
-    chapter_id: int = Form(...),
-    question: str = Form(...),
-    choice_type: str = Form("text"),
-    choice_a: str = Form(""),
-    choice_b: str = Form(""),
-    choice_c: str = Form(""),
-    choice_d: str = Form(""),
-    correct_choice: str = Form(...),
-    explanation: str = Form(""),
-    explanation_wrong: str = Form(""),
-    existing_image: str = Form(""),
-    image: UploadFile | None = File(None),
-    choice_image_a: UploadFile | None = File(None),
-    choice_image_b: UploadFile | None = File(None),
-    choice_image_c: UploadFile | None = File(None),
-    choice_image_d: UploadFile | None = File(None),
-):
-    if choice_type not in ("text", "image"):
-        return {"success": False, "error": "ชนิดตัวเลือกไม่ถูกต้อง"}
-
-    saved = [] 
-    def cleanup():
-        for n in saved:
-            try: os.remove(os.path.join(QUIZ_UPLOAD_DIR, n))
-            except OSError: pass
-
-    # จัดการรูปโจทย์
-    image_file = existing_image if existing_image else None
-    if image and image.filename:
-        name, err = save_quiz_image(image)
-        if err: return {"success": False, "error": err}
-        if name: 
-            image_file = name
-            saved.append(name)
-
-    choices = {"a": choice_a, "b": choice_b, "c": choice_c, "d": choice_d}
-
-    # จัดการตัวเลือกแบบรูปภาพ
-    if choice_type == "image":
-        for letter, f in (("a", choice_image_a), ("b", choice_image_b),
-                          ("c", choice_image_c), ("d", choice_image_d)):
-            # ถ้ามีอัปโหลดใหม่
-            if f and f.filename:
-                name, err = save_quiz_image(f)
-                if err: 
-                    cleanup()
-                    return {"success": False, "error": err}
-                if name:
-                    saved.append(name)
-                    choices[letter] = name
-            # ถ้าไม่อัปโหลดใหม่ ให้ใช้ค่าเดิม (ที่ frontend ส่งมาใน choice_a-d)
-
-    conn = get_conn()
-    try:
-        with conn.cursor() as c:
-            c.execute(
-                """UPDATE quiz_questions 
-                   SET chapter_id=%s, question=%s, choice_type=%s, choice_a=%s, choice_b=%s, 
-                       choice_c=%s, choice_d=%s, correct_choice=%s, image_file=%s, 
-                       explanation=%s, explanation_wrong=%s
-                   WHERE question_id=%s""",
-                (chapter_id, question, choice_type, choices["a"], choices["b"], choices["c"],
-                 choices["d"], correct_choice, image_file, explanation, explanation_wrong, question_id),
-            )
-        conn.commit()
-        return {"success": True}
-    except Exception as e:
-        cleanup()
         return {"success": False, "error": f"Database Error: {str(e)}"}
     finally:
         conn.close()
